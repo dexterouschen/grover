@@ -18,6 +18,7 @@ class Grover
       fix_integer_options!
       fix_float_options!
       fix_array_options!
+      fix_string_options!
       @options
     end
 
@@ -56,6 +57,12 @@ class Grover
     def fix_array_options!
       fix_options!('launch_args') do |value|
         value.is_a?(String) ? YAML.safe_load(value) : value
+      end
+    end
+
+    def fix_string_options!
+      fix_options!('browser_ws_endpoint') do |value|
+        value.is_a?(Proc) ? value.call : value
       end
     end
   end
