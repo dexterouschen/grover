@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require 'combine_pdf'
-
 class Grover
   #
   # Rack middleware for catching PDF requests and returning the upstream HTML as a PDF
@@ -42,9 +40,9 @@ class Grover
 
     private
 
-    PDF_REGEX = /\.pdf$/i.freeze
-    PNG_REGEX = /\.png$/i.freeze
-    JPEG_REGEX = /\.jpe?g$/i.freeze
+    PDF_REGEX = /\.pdf$/i
+    PNG_REGEX = /\.png$/i
+    JPEG_REGEX = /\.jpe?g$/i
 
     attr_reader :pdf_request, :png_request, :jpeg_request
 
@@ -87,7 +85,7 @@ class Grover
     end
 
     def html_content?(headers)
-      headers['Content-Type'] =~ %r{text/html|application/xhtml\+xml}
+      headers['content-type'] =~ %r{text/html|application/xhtml\+xml}
     end
 
     def update_response(response, headers)
@@ -132,10 +130,17 @@ class Grover
     end
 
     def add_cover_content(grover)
+      load_combine_pdf
       pdf = CombinePDF.parse grover.to_pdf
       pdf >> fetch_cover_pdf(grover.front_cover_path) if grover.show_front_cover?
       pdf << fetch_cover_pdf(grover.back_cover_path) if grover.show_back_cover?
       pdf.to_pdf
+    end
+
+    def load_combine_pdf
+      require 'combine_pdf'
+    rescue ::LoadError
+      raise Grover::Error, 'Please add/install the "combine_pdf" gem to use the front/back cover page feature'
     end
 
     def fetch_cover_pdf(path)
@@ -150,11 +155,11 @@ class Grover
 
     def assign_headers(headers, body, content_type)
       # Do not cache results
-      headers.delete 'ETag'
-      headers.delete 'Cache-Control'
+      headers.delete 'etag'
+      headers.delete 'cache-control'
 
-      headers['Content-Length'] = (body.respond_to?(:bytesize) ? body.bytesize : body.size).to_s
-      headers['Content-Type'] = content_type
+      headers['content-length'] = (body.respond_to?(:bytesize) ? body.bytesize : body.size).to_s
+      headers['content-type'] = content_type
     end
 
     def configure_env_for_grover_request(env)
