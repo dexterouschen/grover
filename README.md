@@ -1,6 +1,4 @@
 [![Test Build Status](https://github.com/Studiosity/grover/actions/workflows/test.yml/badge.svg)](https://github.com/Studiosity/grover/actions/workflows/test.yml)
-[![Maintainability](https://api.codeclimate.com/v1/badges/37609653789bcf2c8d94/maintainability)](https://codeclimate.com/github/Studiosity/grover/maintainability)
-[![Test Coverage](https://api.codeclimate.com/v1/badges/37609653789bcf2c8d94/test_coverage)](https://codeclimate.com/github/Studiosity/grover/test_coverage)
 [![Gem Version](https://badge.fury.io/rb/grover.svg)](https://badge.fury.io/rb/grover)
 
 # Grover
@@ -116,6 +114,7 @@ Grover.configure do |config|
     hover: '#another-element',
     cache: false,
     timeout: 0, # Timeout in ms. A value of `0` means 'no timeout'
+    launch_timeout: 3000, # Timeout when launching the browser
     request_timeout: 1000, # Timeout when fetching the content (overloads the `timeout` option)
     convert_timeout: 2000, # Timeout when converting the content (overloads the `timeout` option, only applies to PDF conversion)
     launch_args: ['--font-render-hinting=medium'],
@@ -165,18 +164,20 @@ if the initial content request or any subsequent asset request returns a bad res
 The `raise_on_js_error` option, when enabled, will raise a `Grover::JavaScript::PageRenderError` if any uncaught
 Javascript errors occur when trying to render the page.
 
+The `javascript_enabled` option can be used to disable JavaScript. See https://github.com/puppeteer/puppeteer/blob/main/docs/api/puppeteer.page.setjavascriptenabled.md
+
 The Chrome/Chromium executable path can be overridden with the `executable_path` option.
 
 Supplementary JavaScript can be executed on the page (after render and before conversion to PDF/image)
 by passing it to the `execute_script` option.
 
-```javascript
+```ruby
 Grover.new(<some url>, execute_script: 'document.getElementsByTagName("footer")[0].innerText = "Hey"').to_pdf
 ```
 
 You can also evaluate JavaScript on the page before any of its scripts is run, by passing it a string to the `evaluate_on_new_document` option. See https://github.com/puppeteer/puppeteer/blob/main/docs/api/puppeteer.page.evaluateonnewdocument.md
 
-```javascript
+```ruby
 Grover.new(<some url>, evaluate_on_new_document: 'window.someConfig = "some value"').to_pdf
 ```
 
@@ -186,6 +187,14 @@ only really makes sense if you're calling Grover directly (and not via middlewar
 
 ```ruby
 Grover.new('<some URI with basic authentication', username: 'the username', password: 'super secret').to_pdf
+```
+
+#### Firefox
+
+Grover can drive Firefox by specifying the `browser` option
+
+```ruby
+Grover.new('<some URI>', browser: 'firefox').to_pdf
 ```
 
 #### Remote Chromium
@@ -417,7 +426,7 @@ end
 ```
 
 ### allow_file_uris
-The `allow_file_uris` option can be used to render an html document from the file system.
+The `allow_file_uris` option can be used to render an HTML document from the file system.
 This should be used with *EXTREME CAUTION*. If used improperly it could potentially be manipulated to reveal
 sensitive files on the system. Do not enable if rendering content from outside entities
 (user uploads, external URLs, etc).
@@ -438,6 +447,23 @@ grover = Grover.new('file:///some/local/file.html', format: 'A4')
 
 # Get an inline PDF of the local file
 pdf = grover.to_pdf
+```
+
+### allow_local_network_access
+The `allow_local_network_access` option, when enabled, will allow Grover to make web requests to localhost.
+
+Note, this feature was added in Puppeteer
+[v24.16.0](https://github.com/puppeteer/puppeteer/releases/tag/puppeteer-v24.16.0) with the release of Chrome 139.
+
+It defaults to `false` preventing Puppeteer v24.16.0+ (Chrome 139+) from accessing localhost pages and assets.
+Requests for localhost pages/assets will not be made, but instead error. If you have the `raise_on_request_failure`
+option enabled, the requests will raise a `Grover::JavaScript::RequestFailedError` with the reason `net::ERR_FAILED`.
+
+```ruby
+# config/initializers/grover.rb
+Grover.configure do |config|
+  config.allow_local_network_access = true
+end
 ```
 
 ## Cover pages
@@ -607,6 +633,32 @@ debug: {
 N.B.
 * The headless option disabled is not compatible with exporting of the PDF.
 * If showing the devtools, the browser will halt resulting in a navigation timeout
+
+### Debugging DevTools protocol traffic
+If the above fails, you may consider digging into the DevTools protocol traffic. It includes all info passed to and from
+the browser, so it's a little verbose.
+
+```ruby
+Grover.configuration.node_env_vars = { 'DEBUG' => "puppeteer:*" }
+
+grover = Grover.new('Hello World')
+grover.to_pdf
+grover.debug_output
+=> [
+  "2026-02-04T14:51:42.783Z puppeteer:browsers:launcher Launching <path to Chrome> <various Chrome options>",
+  "2026-02-04T14:51:42.786Z puppeteer:browsers:launcher Launched <Chrome PID>",
+  "2026-02-04T14:51:43.323Z puppeteer:protocol:SEND ► [ '{\"method\":\"Target.setDiscoverTargets\",\"params\":{\"discover\":true,\"filter\":[{}]},\"id\":1}' ]",
+  ...
+  "2026-02-04T14:51:44.366Z puppeteer:browsers:launcher Browser process <Chrome PID> onExit"  
+]
+```
+
+`Grover#debug_output` will only be populated if the `DEBUG` Node env var is set, it will otherwise be `nil`.
+
+See the [Puppeteer devtools debugging documentation](https://pptr.dev/guides/debugging#log-devtools-protocol-traffic)
+for more details on how to apply the DEBUG env flags. 
+
+*Note*, the DEBUG option should definitely not be used/left on by default. The output captured may include sensitive information. 
 
 ## Troubleshooting
 

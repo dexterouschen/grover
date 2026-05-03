@@ -9,6 +9,9 @@ class Grover
   class OptionsFixer
     FALSE_VALUES = [nil, false, 0, '0', 'f', 'F', 'false', 'FALSE', 'off', 'OFF'].freeze
 
+    JAVASCRIPT_OPTIONS = %w[evaluate_on_new_document execute_script script_tag_options wait_for_function].freeze
+    private_constant :JAVASCRIPT_OPTIONS
+
     def initialize(options)
       @options = options
     end
@@ -19,6 +22,7 @@ class Grover
       fix_float_options!
       fix_array_options!
       fix_string_options!
+      disable_javascript_options!
       @options
     end
 
@@ -36,13 +40,14 @@ class Grover
       fix_options!(
         'display_header_footer', 'full_page', 'landscape', 'omit_background', 'prefer_css_page_size',
         'print_background', 'viewport.has_touch', 'viewport.is_landscape', 'viewport.is_mobile', 'bypass_csp',
-        'raise_on_request_failure', 'raise_on_js_error'
+        'raise_on_request_failure', 'raise_on_js_error', 'javascript_enabled'
       ) { |value| !FALSE_VALUES.include?(value) }
     end
 
     def fix_integer_options!
       fix_options!(
-        'viewport.height', 'viewport.width', 'wait_for_timeout',
+        'viewport.height', 'viewport.width',
+        'timeout', 'launch_timeout', 'request_timeout', 'convert_timeout', 'wait_for_timeout',
         &:to_i
       )
     end
@@ -65,6 +70,21 @@ class Grover
       fix_options!('browser_ws_endpoint') do |value|
         value.is_a?(Proc) ? value.call : value
       end
+    end
+
+    def disable_javascript_options!
+      return if @options['javascript_enabled'] != false
+
+      JAVASCRIPT_OPTIONS.each do |option|
+        disable_javascript_option!(option)
+      end
+    end
+
+    def disable_javascript_option!(option)
+      return unless @options.key?(option)
+
+      @options.delete(option)
+      warn "#{self.class}: option #{option} has been disabled because javascript_enabled is set to false"
     end
   end
 end

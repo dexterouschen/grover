@@ -12,10 +12,59 @@ describe Grover::Processor do
     let(:options) { {} }
     let(:date) do
       # New version of Chromium (v93) that comes with v10.2.0 of puppeteer uses a different date format
-      date_format = puppeteer_version_on_or_after?('10.2.0') ? '%-m/%-d/%y, %-l:%M %p' : '%-m/%-d/%Y'
+      date_format =
+        if puppeteer_version_on_or_after?('10.2.0')
+          # AU locale uses a different date format
+          locale == 'en_AU.UTF-8' ? '%-d/%m/%Y, %-k:%M' : '%-m/%-d/%y, %-l:%M %p'
+        else
+          '%-m/%-d/%Y'
+        end
       Time.now.strftime date_format
     end
     let(:protocol) { puppeteer_version_on_or_after?('21') ? 'https' : 'http' }
+    let(:locale) { `locale`[/LC_TIME="([^"]+)"/, 1] || 'en_US.UTF-8' }
+
+    shared_examples 'assigns @debug_output' do
+      context 'when DEBUG option is not set' do
+        it 'does not assign @debug_output' do
+          expect do
+            convert
+          end.not_to change { processor.instance_variable_get :@debug_output }.from nil
+        end
+      end
+
+      context 'when DEBUG option is set' do
+        let(:timestamp_regex) { '20\d{2}\-\d{2}\-\d{2}T\d{2}:\d{2}:\d{2}.\d{3}Z' }
+
+        before do
+          allow(Grover.configuration).to(
+            receive(:node_env_vars).
+              and_return('DEBUG' => 'puppeteer:*,-puppeteer:protocol:*')
+          )
+        end
+
+        it 'assigns @debug_output to include DevTools protocol traffic' do
+          convert
+          debug_output = processor.instance_variable_get :@debug_output
+          expect(debug_output).to be_an Array
+          expect(debug_output.length).to eq 3
+
+          sandbox_args = ENV['GROVER_NO_SANDBOX'] == 'true' ? '--no-sandbox --disable-setuid-sandbox ' : ''
+          puppeteer_version = ENV.fetch('PUPPETEER_VERSION', '')
+          env_args = puppeteer_version == '' ? '' : " PUPPETEER_VERSION: '#{puppeteer_version}' "
+
+          expect(debug_output[0]).to match Regexp.new(<<~REGEX.delete("\n"))
+            \\A#{timestamp_regex.gsub('\\', '\\\\')} puppeteer:browsers:launcher Launching .*chrome.*
+             about:blank #{sandbox_args}--remote-debugging-port=0
+             \\{ detached: true, env: \\{#{env_args}\\}, stdio: \\[ 'pipe', '(pipe|ignore)', 'pipe' \\] \\}\\z
+          REGEX
+          expect(debug_output[1]).to match(/\A#{timestamp_regex} puppeteer:browsers:launcher Launched \d{2,6}\z/)
+          expect(debug_output[2]).to(
+            match(/\A#{timestamp_regex} puppeteer:browsers:launcher Browser process \d{2,6} onExit\z/)
+          )
+        end
+      end
+    end
 
     context 'when converting to PDF' do
       let(:method) { :pdf }
@@ -39,6 +88,8 @@ describe Grover::Processor do
       it 'cleans up the worker process' do
         expect { convert }.not_to(change { `ps | grep node | grep -v 'grep node' | wc -l` })
       end
+
+      it_behaves_like 'assigns @debug_output'
 
       context 'when passing through a valid URL' do
         let(:url_or_html) { 'http://localhost:4567' }
@@ -519,6 +570,56 @@ describe Grover::Processor do
         end
       end
 
+      context 'when using a persistent remote browser, sessions are isolated between requests' do
+        let(:url_or_html) do
+          '<html><body><script>document.write(document.cookie || "no cookies")</script></body></html>'
+        end
+        let(:launch_args) { ENV['GROVER_NO_SANDBOX'] == 'true' ? '["--no-sandbox","--disable-setuid-sandbox"]' : '[]' }
+        let(:chrome_io) do
+          # Launch a persistent Chrome instance and get its WS endpoint. We own this browser,
+          # so cookies in the default context persist across connections.
+          IO.popen(['node', '-e', <<~JS], err: File::NULL)
+            const puppeteer = require('puppeteer');
+            puppeteer.launch({ args: #{launch_args} }).then(browser => {
+              process.stdout.write(browser.wsEndpoint() + '\\n');
+              process.on('SIGTERM', () => browser.close().then(() => process.exit(0)));
+            });
+          JS
+        end
+        let(:browser_ws_endpoint) { chrome_io.gets.strip }
+
+        after do
+          # Clean up the Chrome instance and IO
+          begin
+            Process.kill('TERM', chrome_io.pid)
+          rescue StandardError
+            nil
+          end
+          begin
+            chrome_io.close
+          rescue StandardError
+            nil
+          end
+        end
+
+        it 'does not leak cookies from one request into the next' do
+          # First request sets a cookie via evaluateOnNewDocument (runs in the page JS context
+          # before the page's own scripts, works in both default and incognito contexts)
+          first_result = processor.convert(
+            method, url_or_html,
+            'browserWsEndpoint' => browser_ws_endpoint,
+            'evaluateOnNewDocument' => "document.cookie = 'session-secret=abc123'"
+          )
+          first_text = Grover::Utils.squish(PDF::Reader.new(StringIO.new(first_result)).pages.first.text)
+          expect(first_text).to include 'session-secret=abc123'
+
+          # Second request — the cookie from request 1 must not be visible
+          result = processor.convert method, url_or_html, 'browserWsEndpoint' => browser_ws_endpoint
+          text = Grover::Utils.squish(PDF::Reader.new(StringIO.new(result)).pages.first.text)
+          expect(text).to eq 'no cookies'
+        end
+      end
+
       unless linux_system? # It looks like the way a connection failure is handled is different on Linux systems
         context 'when passing through WS launch params without a remote browser' do
           let(:options) { { 'browserWsEndpoint' => 'ws://localhost:3000/' } }
@@ -706,7 +807,11 @@ describe Grover::Processor do
       end
 
       context 'when raise on request failure option is specified' do
-        let(:options) { basic_header_footer_options.merge('raiseOnRequestFailure' => true) }
+        let(:options) do
+          basic_header_footer_options.
+            merge('raiseOnRequestFailure' => true, 'allowLocalNetworkAccess' => allow_local_network_access)
+        end
+        let(:allow_local_network_access) { true }
 
         context 'when a failure occurs it raises an error' do
           let(:url_or_html) do
@@ -776,13 +881,25 @@ describe Grover::Processor do
                 <head><link rel="icon" href="data:;base64,iVBORw0KGgo="></head>
                 <body>
                   Hey there
-                  <img src="https://httpstat.us/304" />
+                  <img src="http://127.0.0.1:4567/304" />
                 </body>
               </html>
             HTML
           end
 
           it { expect(pdf_text_content).to include 'Hey there' }
+
+          if puppeteer_version_on_or_after? '24.16.0'
+            context 'when local network access is not allowed (default)' do
+              let(:allow_local_network_access) { false }
+
+              it 'raises a RequestFailedError' do
+                expect { convert }.to(
+                  raise_error(Grover::JavaScript::RequestFailedError, 'net::ERR_FAILED at http://127.0.0.1:4567/304')
+                )
+              end
+            end
+          end
         end
 
         context 'when assets have redirects PDFs are generated successfully' do
@@ -795,7 +912,7 @@ describe Grover::Processor do
               <html>
                 <head><link rel='icon' href='data:;base64,iVBORw0KGgo='></head>
                 <body>
-                  <img src="http://localhost:4567/cat.png" />
+                  <img src="http://127.0.0.1:4567/cat.png" />
                 </body>
               </html>
             HTML
@@ -804,6 +921,21 @@ describe Grover::Processor do
           it do
             _, stream = pdf_reader.pages.first.xobjects.first
             expect(stream.hash[:Subtype]).to eq :Image
+          end
+
+          if puppeteer_version_on_or_after? '24.16.0'
+            context 'when local network access is not allowed (default)' do
+              let(:allow_local_network_access) { false }
+
+              it 'raises a RequestFailedError' do
+                expect { convert }.to(
+                  raise_error(
+                    Grover::JavaScript::RequestFailedError,
+                    'net::ERR_FAILED at http://127.0.0.1:4567/cat.png'
+                  )
+                )
+              end
+            end
           end
         end
       end
@@ -903,7 +1035,7 @@ describe Grover::Processor do
             <<-HTML
               <html>
                 <head><link rel='icon' href='data:;base64,iVBORw0KGgo='></head>
-              #{'  '}
+
                 <body>
                   <p id="loading">Loading</p>
                   <p id="content" style="display: none">Loaded</p>
@@ -969,7 +1101,7 @@ describe Grover::Processor do
             expect { convert }.to raise_error Grover::JavaScript::TimeoutError, 'Navigation timeout of 1 ms exceeded'
           end
         else
-          it do
+          it 'times out when launching the browser' do
             expect { convert }.to raise_error(
               Grover::JavaScript::TimeoutError,
               'Navigation Timeout Exceeded: 1ms exceeded'
@@ -989,6 +1121,28 @@ describe Grover::Processor do
 
         context 'when the timeout is long' do
           let(:timeout) { 10_000 }
+
+          it { is_expected.to start_with "%PDF-1.4\n" }
+        end
+      end
+
+      context 'when launchTimeout option is specified' do
+        let(:options) { basic_header_footer_options.merge('launchTimeout' => launch_timeout) }
+        let(:launch_timeout) { nil }
+
+        context 'when the launch timeout is short' do
+          let(:launch_timeout) { 1 }
+
+          it do
+            expect { convert }.to raise_error(
+              Grover::JavaScript::TimeoutError,
+              'Timed out after 1 ms while waiting for the WS endpoint URL to appear in stdout!'
+            )
+          end
+        end
+
+        context 'when the launch timeout is long' do
+          let(:launch_timeout) { 10_000 }
 
           it { is_expected.to start_with "%PDF-1.4\n" }
         end
@@ -1085,6 +1239,48 @@ describe Grover::Processor do
           end
         end
       end
+
+      context 'when javaScriptEnabled option is set' do
+        let(:options) { basic_header_footer_options.merge('javaScriptEnabled' => enabled) }
+
+        let(:url_or_html) do
+          <<-HTML
+            <html>
+              <body>
+                <script>document.write('output from script tag')</script>
+                <noscript>output from noscript tag</noscript>
+              </body>
+            </html>
+          HTML
+        end
+
+        context 'when it is true' do
+          let(:enabled) { true }
+
+          it { expect(pdf_text_content).to include 'output from script tag' }
+          it { expect(pdf_text_content).not_to include 'output from noscript tag' }
+        end
+
+        context 'when it is false' do
+          let(:enabled) { false }
+
+          it { expect(pdf_text_content).not_to include 'output from script tag' }
+          it { expect(pdf_text_content).to include 'output from noscript tag' }
+        end
+      end
+
+      # < v23 of puppeteer has issues installing the latest firefox versions (bz2 vs xz compression used for packaging)
+      if puppeteer_version_on_or_after? '23'
+        context 'when specifying Firefox browser' do
+          let(:options) { { 'browser' => 'firefox', 'executablePath' => firefox_path } }
+          let(:firefox_path) { Dir[File.expand_path('~/.cache/puppeteer/firefox/**/firefox')].last }
+          let(:url_or_html) { 'http://localhost:4567/headers' }
+
+          it { expect(pdf_text_content).to match(/Request contained \d+ headers/) }
+          it { expect(pdf_text_content).to include '1. host localhost:4567' }
+          it { expect(pdf_text_content).to match %r{\d\. user-agent Mozilla/5.0 .* Firefox/} }
+        end
+      end
     end
 
     context 'when converting to an image' do
@@ -1103,11 +1299,20 @@ describe Grover::Processor do
         # don't really want to rely on pixel testing the website screenshot
         # so we'll check it's mean colour is roughly what we expect
         it do
-          pixel_mean = puppeteer_version_on_or_after?('22.9.0') ? 140.925 : 161.497
+          pixel_mean =
+            if puppeteer_version_on_or_after?('24.0.0') && puppeteer_version_on_or_before?('24.15.0')
+              169.444
+            elsif puppeteer_version_on_or_after?('22.9.0')
+              140.925
+            else
+              161.497
+            end
 
           expect(image.data.dig('imageStatistics', MiniMagick.imagemagick7? ? 'Overall' : 'all', 'mean').to_f).
             to be_within(10).of(pixel_mean)
         end
+
+        it_behaves_like 'assigns @debug_output'
       end
 
       context 'when passing through HTML' do
@@ -1117,6 +1322,8 @@ describe Grover::Processor do
         it { expect(image.type).to eq 'PNG' }
         it { expect(image.dimensions).to eq [800, 600] }
         it { expect(mean_colour_statistics(image)).to eq %w[0 0 255] }
+
+        it_behaves_like 'assigns @debug_output'
       end
 
       context 'when using remote browser option with HTML', :remote_browser do
@@ -1284,6 +1491,18 @@ describe Grover::Processor do
           )
         )
       end
+    end
+  end
+
+  describe '#debug_output' do
+    subject(:debug_output) { processor.debug_output }
+
+    it { is_expected.to be_nil }
+
+    context 'when there is debug output assigned' do
+      before { processor.instance_variable_set :@debug_output, ['interesting result'] }
+
+      it { is_expected.to eq ['interesting result'] }
     end
   end
 end

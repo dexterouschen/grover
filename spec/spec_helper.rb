@@ -1,11 +1,9 @@
 # frozen_string_literal: true
 
-require 'simplecov'
-SimpleCov.start
-
 $LOAD_PATH.unshift File.expand_path('../lib', __dir__)
 require 'grover'
 
+require 'rspec/retry'
 require 'rack/test'
 require 'stringio'
 require 'pdf-reader'
@@ -15,6 +13,13 @@ require_relative 'support/test_server'
 RSpec.configure do |config|
   config.order = 'random'
   config.filter_run_excluding remote_browser: true
+
+  if ENV['CI'] == 'true'
+    # Retry
+    config.verbose_retry = true
+    config.default_retry_count = 3
+    config.default_sleep_interval = 5
+  end
 
   config.before(:suite) do
     TestServer.start
@@ -32,11 +37,11 @@ def fixture_path(file)
 end
 
 def puppeteer_version_on_or_after?(version)
-  puppeteer_version.empty? || Gem::Version.new(puppeteer_version) >= Gem::Version.new(version)
+  puppeteer_version.nil? || puppeteer_version.empty? || Gem::Version.new(puppeteer_version) >= Gem::Version.new(version)
 end
 
 def puppeteer_version_on_or_before?(version)
-  puppeteer_version.empty? || Gem::Version.new(puppeteer_version) <= Gem::Version.new(version)
+  puppeteer_version.nil? || puppeteer_version.empty? || Gem::Version.new(puppeteer_version) <= Gem::Version.new(version)
 end
 
 def puppeteer_version
